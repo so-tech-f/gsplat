@@ -92,7 +92,7 @@ class Config:
     # Initialization strategy
     init_type: str = "sfm"
     # Initial number of GSs. Ignored if using sfm
-    init_num_pts: int = 100_000
+    init_num_pts: int = 10
     # Initial extent of GSs as a multiple of the camera extent. Ignored if using sfm
     init_extent: float = 3.0
     # Degree of spherical harmonics
