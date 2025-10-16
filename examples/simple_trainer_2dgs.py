@@ -3,7 +3,7 @@ import math
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 from pathlib import Path
 
 import imageio
@@ -20,6 +20,7 @@ from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+from typing_extensions import Literal, assert_never
 from utils import (
     AppearanceOptModule,
     CameraOptModule,
@@ -31,7 +32,7 @@ from utils import (
 )
 from gsplat_viewer_2dgs import GsplatViewer, GsplatRenderTabState
 from gsplat.rendering import rasterization_2dgs, rasterization_2dgs_inria_wrapper
-from gsplat.strategy import DefaultStrategy
+from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from nerfview import CameraState, RenderTabState, apply_float_colormap
 
 
@@ -112,6 +113,11 @@ class Config:
     # Refine GSs every this steps
     refine_every: int = 100
 
+    # Strategy for GS densification
+    strategy: Union[DefaultStrategy, MCMCStrategy] = field(
+        default_factory=DefaultStrategy
+    )
+
     # Use packed mode for rasterization, this leads to less memory usage but slightly slower.
     packed: bool = False
     # Use sparse gradients for optimization. (experimental)
@@ -125,6 +131,11 @@ class Config:
 
     # Use random background for training to discourage transparency
     random_bkgd: bool = False
+
+    # Opacity regularization
+    opacity_reg: float = 0.0
+    # Scale regularization
+    scale_reg: float = 0.0
 
     # Enable camera optimization.
     pose_opt: bool = False
@@ -176,10 +187,19 @@ class Config:
         self.save_steps = [int(i * factor) for i in self.save_steps]
         self.max_steps = int(self.max_steps * factor)
         self.sh_degree_interval = int(self.sh_degree_interval * factor)
-        self.refine_start_iter = int(self.refine_start_iter * factor)
-        self.refine_stop_iter = int(self.refine_stop_iter * factor)
-        self.reset_every = int(self.reset_every * factor)
-        self.refine_every = int(self.refine_every * factor)
+
+        strategy = self.strategy
+        if isinstance(strategy, DefaultStrategy):
+            strategy.refine_start_iter = int(strategy.refine_start_iter * factor)
+            strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
+            strategy.reset_every = int(strategy.reset_every * factor)
+            strategy.refine_every = int(strategy.refine_every * factor)
+        elif isinstance(strategy, MCMCStrategy):
+            strategy.refine_start_iter = int(strategy.refine_start_iter * factor)
+            strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
+            strategy.refine_every = int(strategy.refine_every * factor)
+        else:
+            assert_never(strategy)
 
 
 def create_splats_with_optimizers(
@@ -210,6 +230,8 @@ def create_splats_with_optimizers(
     dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
     dist_avg = torch.sqrt(dist2_avg)
     scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
+    scales[:, 2] = torch.log(torch.tensor(1e-16))
+
     quats = torch.rand((N, 4))  # [N, 4]
     opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
 
@@ -309,29 +331,24 @@ class Runner:
         print("Model initialized. Number of GS:", len(self.splats["means"]))
         self.model_type = cfg.model_type
 
+        self.strategy.check_sanity(self.splats, self.optimizers)
+
         if self.model_type == "2dgs":
             key_for_gradient = "gradient_2dgs"
         else:
             key_for_gradient = "means2d"
 
-        # Densification Strategy
-        self.strategy = DefaultStrategy(
-            verbose=True,
-            prune_opa=cfg.prune_opa,
-            grow_grad2d=cfg.grow_grad2d,
-            grow_scale3d=cfg.grow_scale3d,
-            prune_scale3d=cfg.prune_scale3d,
-            # refine_scale2d_stop_iter=4000, # splatfacto behavior
-            refine_start_iter=cfg.refine_start_iter,
-            refine_stop_iter=cfg.refine_stop_iter,
-            reset_every=cfg.reset_every,
-            refine_every=cfg.refine_every,
-            absgrad=cfg.absgrad,
-            revised_opacity=cfg.revised_opacity,
-            key_for_gradient=key_for_gradient,
-        )
-        self.strategy.check_sanity(self.splats, self.optimizers)
-        self.strategy_state = self.strategy.initialize_state()
+        if isinstance(self.cfg.strategy, DefaultStrategy):
+            for attr in ['prune_opa', 'grow_grad2d', 'grow_scale3d', 'prune_scale3d', 'absgrad', 'revised_opacity']:
+                setattr(self.cfg.strategy, attr, getattr(self.cfg, attr))
+            self.cfg.strategy.key_for_gradient = key_for_gradient
+            self.strategy_state = self.cfg.strategy.initialize_state(
+                scene_scale=self.scene_scale
+            )
+        elif isinstance(self.cfg.strategy, MCMCStrategy):
+            self.strategy_state = self.cfg.strategy.initialize_state()
+        else:
+            assert_never(self.cfg.strategy)
 
         self.pose_optimizers = []
         if cfg.pose_opt:
@@ -436,7 +453,11 @@ class Runner:
                 width=width,
                 height=height,
                 packed=self.cfg.packed,
-                absgrad=self.cfg.absgrad,
+                absgrad=(
+                    self.cfg.strategy.absgrad
+                    if isinstance(self.cfg.strategy, DefaultStrategy)
+                    else False
+                ),
                 sparse_grad=self.cfg.sparse_grad,
                 **kwargs,
             )
@@ -636,6 +657,12 @@ class Runner:
                 distloss = render_distort.mean()
                 loss += distloss * curr_dist_lambda
 
+            # regularizations for mcmc starategy
+            if cfg.opacity_reg > 0.0:
+                loss += cfg.opacity_reg * torch.sigmoid(self.splats["opacities"]).mean()
+            if cfg.scale_reg > 0.0:
+                loss += cfg.scale_reg * torch.exp(self.splats["scales"]).mean()
+
             loss.backward()
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
@@ -673,14 +700,26 @@ class Runner:
                     self.writer.add_image("train/render", canvas, step)
                 self.writer.flush()
 
-            self.strategy.step_post_backward(
-                params=self.splats,
-                optimizers=self.optimizers,
-                state=self.strategy_state,
-                step=step,
-                info=info,
-                packed=cfg.packed,
-            )
+            if isinstance(self.cfg.strategy, DefaultStrategy):
+                self.cfg.strategy.step_post_backward(
+                    params=self.splats,
+                    optimizers=self.optimizers,
+                    state=self.strategy_state,
+                    step=step,
+                    info=info,
+                    packed=cfg.packed,
+                )
+            elif isinstance(self.cfg.strategy, MCMCStrategy):
+                self.cfg.strategy.step_post_backward(
+                    params=self.splats,
+                    optimizers=self.optimizers,
+                    state=self.strategy_state,
+                    step=step,
+                    info=info,
+                    lr=schedulers[0].get_last_lr()[0],
+                )
+            else:
+                assert_never(self.cfg.strategy)
 
             # Turn Gradients into Sparse Tensor before running optimizer
             if cfg.sparse_grad:
@@ -1025,6 +1064,26 @@ def main(cfg: Config):
 
 
 if __name__ == "__main__":
-    cfg = tyro.cli(Config)
+    # Config objects we can choose between.
+    # Each is a tuple of (CLI description, config object).
+    configs = {
+        "default": (
+            "Gaussian splatting training using densification heuristics from the original paper.",
+            Config(
+                strategy=DefaultStrategy(verbose=True),
+            ),
+        ),
+        "mcmc": (
+            "Gaussian splatting training using densification from the paper '3D Gaussian Splatting as Markov Chain Monte Carlo'.",
+            Config(
+                init_opa=0.5,
+                init_scale=0.1,
+                opacity_reg=0.01,
+                scale_reg=0.01,
+                strategy=MCMCStrategy(verbose=True),
+            ),
+        ),
+    }
+    cfg = tyro.extras.overridable_config_cli(configs)
     cfg.adjust_steps(cfg.steps_scaler)
     main(cfg)
