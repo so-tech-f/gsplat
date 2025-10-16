@@ -28,7 +28,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
-from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
+from utils import AppearanceOptModule, CameraOptModule, CameraOptModuleMLP, knn, rgb_to_sh, set_random_seed
 
 from gsplat import export_splats
 from gsplat.compression import PngCompression
@@ -147,6 +147,8 @@ class Config:
 
     # Enable camera optimization.
     pose_opt: bool = False
+    # Type of camera optimization
+    pose_opt_type: Literal["default", "mlp"] = "default"
     # Learning rate for camera optimization
     pose_opt_lr: float = 1e-5
     # Regularization for camera optimization as weight decay
@@ -396,7 +398,14 @@ class Runner:
 
         self.pose_optimizers = []
         if cfg.pose_opt:
-            self.pose_adjust = CameraOptModule(len(self.trainset)).to(self.device)
+            if cfg.pose_opt_type == "default":
+                self.pose_adjust = CameraOptModule(len(self.trainset)).to(self.device)
+            elif cfg.pose_opt_type == "mlp":
+                self.pose_adjust = CameraOptModuleMLP(len(self.trainset)).to(self.device)
+                cfg.pose_opt_lr = 15e-5
+            else:
+                assert_never(self.cfg.pose_opt_type)
+
             self.pose_adjust.zero_init()
             self.pose_optimizers = [
                 torch.optim.Adam(

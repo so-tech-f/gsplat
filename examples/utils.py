@@ -48,6 +48,80 @@ class CameraOptModule(torch.nn.Module):
         return torch.matmul(camtoworlds, transform)
 
 
+class CameraOptModuleMLP(torch.nn.Module):
+    """Camera pose optimization module using MLP."""
+
+    def __init__(self, n: int, mlp_width: int = 64, mlp_depth: int = 2, 
+                trainset=None,):
+        super().__init__()
+        # Identity rotation in 6D representation
+        self.register_buffer("identity", torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]))
+
+        # Initial embeddings for each camera
+        self.embeds = torch.nn.Embedding(n, mlp_width)
+        self.num_cams = n
+
+        # MLP layers
+        activation = torch.nn.ReLU(inplace=True)
+        layers = []
+        layers.append(torch.nn.Linear(mlp_width, mlp_width))
+        layers.append(activation)
+        for _ in range(mlp_depth - 1):
+            layers.append(torch.nn.Linear(mlp_width, mlp_width))
+            layers.append(activation)
+        # Output layer produces 9D adjustments (3D position + 6D rotation)
+        layers.append(torch.nn.Linear(mlp_width, 9))
+        self.mlp = torch.nn.Sequential(*layers)
+
+        self.cam_scale = 1.0
+        if trainset is not None: # cam_scaleを計算するようにしないといけないかも
+            if hasattr(trainset, 'cam_scale'):
+                self.cam_scale = trainset.cam_scale
+
+    def zero_init(self):
+        torch.nn.init.zeros_(self.embeds.weight)
+        #torch.nn.init.normal_(self.embeds.weight)
+        # Also initialize the last layer of MLP with small weights
+        torch.nn.init.zeros_(self.mlp[-1].weight)
+        torch.nn.init.zeros_(self.mlp[-1].bias)
+
+    def random_init(self, std: float):
+        torch.nn.init.normal_(self.embeds.weight, std=std)
+        # Initialize the last layer of MLP with small weights
+        torch.nn.init.normal_(self.mlp[-1].weight, std=std)
+        torch.nn.init.normal_(self.mlp[-1].bias, std=std)
+
+    def forward(self, camtoworlds: Tensor, embed_ids: Tensor) -> Tensor:
+        """Adjust camera pose based on MLP outputs with SGLD noise.
+
+        Args:
+            camtoworlds: (..., 4, 4)
+            embed_ids: (...,)
+
+        Returns:
+            updated camtoworlds: (..., 4, 4)
+        """
+        assert camtoworlds.shape[:-2] == embed_ids.shape
+        batch_shape = camtoworlds.shape[:-2]
+
+        # Get embeddings and process through MLP with noise
+        embeddings = self.embeds(embed_ids)  # (..., mlp_width)
+        pose_deltas = self.mlp(embeddings)  # (..., 9)
+
+        # Split into position and rotation deltas
+        dx, drot = pose_deltas[..., :3], pose_deltas[..., 3:]
+        rot = rotation_6d_to_matrix(
+            drot + self.identity.expand(*batch_shape, -1)
+        )  # (..., 3, 3)
+
+        # Create transformation matrix
+        transform = torch.eye(4, device=pose_deltas.device).repeat((*batch_shape, 1, 1))
+        transform[..., :3, :3] = rot
+        transform[..., :3, 3] = dx * self.cam_scale
+
+        return torch.matmul(camtoworlds, transform)
+
+
 class AppearanceOptModule(torch.nn.Module):
     """Appearance optimization module."""
 
