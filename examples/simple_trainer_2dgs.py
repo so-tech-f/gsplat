@@ -1127,6 +1127,8 @@ if __name__ == "__main__":
                 normal_loss=True,
                 dist_loss=True,
                 save_ply=True,
+                pose_opt=True,
+                pose_opt_type="mlp",
                 strategy=MCMCStrategy(verbose=True),
             ),
         ),
