@@ -37,6 +37,7 @@ from gsplat.rendering import rasterization_2dgs, rasterization_2dgs_inria_wrappe
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from nerfview import CameraState, RenderTabState, apply_float_colormap
 
+LOG_TINY_SCALE = math.log(1e-16)
 
 @dataclass
 class Config:
@@ -240,7 +241,7 @@ def create_splats_with_optimizers(
     dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
     dist_avg = torch.sqrt(dist2_avg)
     scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
-    scales[:, 2] = torch.log(torch.tensor(1e-16, device=scales.device)).detach()
+    scales[:, 2] = LOG_TINY_SCALE
 
     quats = torch.rand((N, 4))  # [N, 4]
     opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
@@ -678,6 +679,10 @@ class Runner:
                 loss += cfg.scale_reg * torch.exp(self.splats["scales"]).mean()
 
             loss.backward()
+
+            if self.splats["scales"].grad is not None:
+                self.splats["scales"].grad[:, 2] = 0.0
+
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:

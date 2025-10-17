@@ -8,7 +8,9 @@ from torch import Tensor
 from gsplat import quat_scale_to_covar_preci
 from gsplat.relocation import compute_relocation
 from gsplat.utils import normalized_quat_to_rotmat
+import math
 
+LOG_TINY_SCALE = math.log(1e-16)
 
 @torch.no_grad()
 def _multinomial_sample(weights: Tensor, n: int, replacement: bool = True) -> Tensor:
@@ -284,7 +286,7 @@ def relocate(
         elif name == "scales":
             p[sampled_idxs] = torch.log(new_scales)
             if model_type == "2dgs":
-                p[sampled_idxs, 2] = torch.log(torch.tensor(1e-16, device=p.device))
+                p[sampled_idxs, 2] = LOG_TINY_SCALE
         p[dead_indices] = p[sampled_idxs]
         return torch.nn.Parameter(p, requires_grad=p.requires_grad)
 
@@ -329,7 +331,7 @@ def sample_add(
         elif name == "scales":
             p[sampled_idxs] = torch.log(new_scales)
             if model_type == "2dgs":
-                p[sampled_idxs, 2] = torch.log(torch.tensor(1e-16, device=p.device))
+                p[sampled_idxs, 2] = LOG_TINY_SCALE
         p_new = torch.cat([p, p[sampled_idxs]])
         return torch.nn.Parameter(p_new, requires_grad=p.requires_grad)
 
