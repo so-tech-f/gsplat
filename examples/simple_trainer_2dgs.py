@@ -325,6 +325,7 @@ class Runner:
             patch_size=cfg.patch_size,
             load_depths=cfg.depth_loss,
         )
+        self.trainvalset = Dataset(self.parser, split="train")
         self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
@@ -860,7 +861,7 @@ class Runner:
             iterator = tqdm.tqdm(range(iters), desc="Optimizing eval camera pose") if show_progress else range(iters)
             for i in iterator:
                 camtoworlds_optim = pose_adjust(camtoworlds, torch.tensor([0],device=self.device))
-                renders, alphas, info = self.rasterize_splats(
+                renders, *_ = self.rasterize_splats(
                     camtoworlds=camtoworlds_optim,
                     Ks=Ks,
                     width=width,
@@ -869,7 +870,6 @@ class Runner:
                     near_plane=near_plane,
                     far_plane=far_plane,
                     masks=masks,
-                    optim_3dgs=True
                 )
 
                 #loss = F.l1_loss(renders, pixels)
@@ -890,11 +890,7 @@ class Runner:
                 optimizer.zero_grad(set_to_none=True)
             for optimizer in self.pose_optimizers:
                 optimizer.zero_grad(set_to_none=True)
-            for optimizer in self.intrinsics_optimizers:
-                optimizer.zero_grad(set_to_none=True)
             for optimizer in self.app_optimizers:
-                optimizer.zero_grad(set_to_none=True)
-            for optimizer in self.bil_grid_optimizers:
                 optimizer.zero_grad(set_to_none=True)
         return camtoworlds_optim.detach()
 
@@ -910,9 +906,10 @@ class Runner:
         trainloader = torch.utils.data.DataLoader(
             self.trainvalset, batch_size=1, shuffle=False, num_workers=1
         )
+        traineval_ellipse_time = 0
         train_metrics = {"psnr": [], "ssim": [], "lpips": []}
 
-        camtoworlds_est, camtoworlds_gt, intrinsics, depthmaps = [], [], [],[]
+        camtoworlds_est, camtoworlds_gt = [], []
         for i, data in enumerate(trainloader):
             camtoworlds = data["camtoworld"].to(device)
             if "camtoworld_gt" in data:
@@ -932,21 +929,13 @@ class Runner:
             masks = data["mask"].to(device) if "mask" in data else None
             height, width = pixels.shape[1:3]
 
-            # intrinsics optimization
-            if cfg.intrinsics_opt:
-                Ks = torch.eye(3, dtype=torch.float32, device=device)[None].expand(camtoworlds.shape[0], 3, 3).clone()
-                Ks[:, 0, 0] = Ks[:, 1, 1] = self.focal_opt.exp()
-                Ks[:, 0:2, 2] = self.pp_opt * self.imsize
-                if step % 50 == 0:
-                    print(Ks)
 
             camtoworlds_est.append(camtoworlds)
             camtoworlds_gt.append(camtoworld_gt)
-            intrinsics.append(Ks)
 
             torch.cuda.synchronize()
             tic = time.time()
-            renders, _, _ = self.rasterize_splats(
+            renders, *_ = self.rasterize_splats(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
                 width=width,
@@ -958,7 +947,7 @@ class Runner:
                 masks=masks,
             )  # [1, H, W, 3]
             torch.cuda.synchronize()
-            ellipse_time += time.time() - tic
+            traineval_ellipse_time += time.time() - tic
 
             colors = torch.clamp(renders[..., 0:3], 0.0, 1.0)  # [1, H, W, 3]
             depths = renders[..., 3:4]  # [1, H, W, 1]
@@ -972,6 +961,8 @@ class Runner:
             train_metrics["ssim"].append(self.ssim(colors_p, pixels_p))
             train_metrics["lpips"].append(self.lpips(colors_p, pixels_p))
 
+        traineval_ellipse_time /= len(trainloader)
+
         if cfg.pose_opt and cfg.pose_opt_type == "mlp":
             a = torch.stack(camtoworlds_est,dim=0).squeeze(1).detach().cpu().numpy()
             b = torch.stack(camtoworlds_gt,dim=0).squeeze(1).detach().cpu().numpy()
@@ -980,7 +971,7 @@ class Runner:
         valloader = torch.utils.data.DataLoader(
             self.valset, batch_size=1, shuffle=False, num_workers=1
         )
-        ellipse_time = 0
+        eval_ellipse_time = 0
         metrics = {"psnr": [], "ssim": [], "lpips": []}
         for i, data in enumerate(valloader):
             camtoworlds = data["camtoworld"].to(device)
@@ -1029,7 +1020,7 @@ class Runner:
             colors = torch.clamp(colors, 0.0, 1.0)
             colors = colors[..., :3]  # Take RGB channels
             torch.cuda.synchronize()
-            ellipse_time += max(time.time() - tic, 1e-10)
+            eval_ellipse_time += max(time.time() - tic, 1e-10)
 
             # write images
             canvas = torch.cat([pixels, colors], dim=2).squeeze(0).cpu().numpy()
@@ -1092,7 +1083,7 @@ class Runner:
             metrics["ssim"].append(self.ssim(colors, pixels))
             metrics["lpips"].append(self.lpips(colors, pixels))
 
-        ellipse_time /= len(valloader)
+        eval_ellipse_time /= len(valloader)
 
         train_psnr = torch.stack(train_metrics["psnr"]).mean()
         train_ssim = torch.stack(train_metrics["ssim"]).mean()
@@ -1105,7 +1096,8 @@ class Runner:
         print(
             f"TRAIN PSNR: {train_psnr.item():.3f}, TRAIN SSIM: {train_ssim.item():.4f}, TRAIN LPIPS: {train_lpips.item():.3f} | "
             f"EVAL PSNR: {eval_psnr.item():.3f}, EVAL SSIM: {eval_ssim.item():.4f}, EVAL LPIPS: {eval_lpips.item():.3f} "
-            f"Time: {ellipse_time:.3f}s/image "
+            f"TRAIN Time: {traineval_ellipse_time:.3f}s/image "
+            f"EVAL Time: {eval_ellipse_time:.3f}s/image "
             f"Number of GS: {len(self.splats['means'])}"
         )
         # save train stats as json
@@ -1113,10 +1105,10 @@ class Runner:
             "train_psnr": train_psnr.item(),
             "train_ssim": train_ssim.item(),
             "train_lpips": train_lpips.item(),
-            "ellipse_time": ellipse_time,
+            "train ellipse_time": traineval_ellipse_time,
             "num_GS": len(self.splats["means"]),
         }
-        with open(f"{self.stats_dir}/train_step{step:04d}.json", "w") as f:
+        with open(f"{self.stats_dir}/train_metrics_step{step:04d}.json", "w") as f:
             json.dump(train_stats, f)
 
         # save eval stats as json
@@ -1124,10 +1116,10 @@ class Runner:
             "eval_psnr": eval_psnr.item(),
             "eval_ssim": eval_ssim.item(),
             "eval_lpips": eval_lpips.item(),
-            "ellipse_time": ellipse_time,
+            "eval ellipse_time": eval_ellipse_time,
             "num_GS": len(self.splats["means"]),
         }
-        with open(f"{self.stats_dir}/val_step{step:04d}.json", "w") as f:
+        with open(f"{self.stats_dir}/val_metrics_step{step:04d}.json", "w") as f:
             json.dump(eval_stats, f)
 
         # save stats to tensorboard
