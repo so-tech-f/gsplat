@@ -1,0 +1,13 @@
+# git
+.git/
+.gitignore
+# test data
+data/
+# test codes
+tests/
+assets/
+# documents
+docs/
+README.md
+*.md
+LICENSE
