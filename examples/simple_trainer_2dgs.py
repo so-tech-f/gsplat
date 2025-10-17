@@ -301,6 +301,8 @@ class Runner:
         os.makedirs(self.stats_dir, exist_ok=True)
         self.render_dir = f"{cfg.result_dir}/renders"
         os.makedirs(self.render_dir, exist_ok=True)
+        self.ply_dir = f"{cfg.result_dir}/ply"
+        os.makedirs(self.ply_dir, exist_ok=True)
 
         # Tensorboard
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
@@ -1118,6 +1120,7 @@ if __name__ == "__main__":
                 normal_loss=True,
                 dist_loss=True,
                 save_ply=True,
+                data_factor=1,
                 strategy=MCMCStrategy(verbose=True),
             ),
         ),
