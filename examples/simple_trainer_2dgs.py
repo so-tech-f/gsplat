@@ -14,6 +14,7 @@ import torch.nn.functional as F
 import tqdm
 import tyro
 import viser
+import yaml
 from datasets.colmap import Dataset, Parser
 from datasets.traj import generate_interpolated_path
 from torch import Tensor
@@ -331,6 +332,7 @@ class Runner:
         print("Model initialized. Number of GS:", len(self.splats["means"]))
         self.model_type = cfg.model_type
 
+        self.strategy = self.cfg.strategy
         self.strategy.check_sanity(self.splats, self.optimizers)
 
         if self.model_type == "2dgs":
@@ -338,17 +340,17 @@ class Runner:
         else:
             key_for_gradient = "means2d"
 
-        if isinstance(self.cfg.strategy, DefaultStrategy):
+        if isinstance(self.strategy, DefaultStrategy):
             for attr in ['prune_opa', 'grow_grad2d', 'grow_scale3d', 'prune_scale3d', 'absgrad', 'revised_opacity']:
-                setattr(self.cfg.strategy, attr, getattr(self.cfg, attr))
-            self.cfg.strategy.key_for_gradient = key_for_gradient
-            self.strategy_state = self.cfg.strategy.initialize_state(
+                setattr(self.strategy, attr, getattr(self.cfg, attr))
+            self.strategy.key_for_gradient = key_for_gradient
+            self.strategy_state = self.strategy.initialize_state(
                 scene_scale=self.scene_scale
             )
-        elif isinstance(self.cfg.strategy, MCMCStrategy):
-            self.strategy_state = self.cfg.strategy.initialize_state()
+        elif isinstance(self.strategy, MCMCStrategy):
+            self.strategy_state = self.strategy.initialize_state()
         else:
-            assert_never(self.cfg.strategy)
+            assert_never(self.strategy)
 
         self.pose_optimizers = []
         if cfg.pose_opt:
@@ -454,8 +456,8 @@ class Runner:
                 height=height,
                 packed=self.cfg.packed,
                 absgrad=(
-                    self.cfg.strategy.absgrad
-                    if isinstance(self.cfg.strategy, DefaultStrategy)
+                    self.strategy.absgrad
+                    if isinstance(self.strategy, DefaultStrategy)
                     else False
                 ),
                 sparse_grad=self.cfg.sparse_grad,
@@ -498,8 +500,8 @@ class Runner:
         device = self.device
 
         # Dump cfg.
-        with open(f"{cfg.result_dir}/cfg.json", "w") as f:
-            json.dump(vars(cfg), f)
+        with open(f"{cfg.result_dir}/cfg.yml", "w") as f:
+            yaml.dump(vars(cfg), f)
 
         max_steps = cfg.max_steps
         init_step = 0
@@ -700,8 +702,8 @@ class Runner:
                     self.writer.add_image("train/render", canvas, step)
                 self.writer.flush()
 
-            if isinstance(self.cfg.strategy, DefaultStrategy):
-                self.cfg.strategy.step_post_backward(
+            if isinstance(self.strategy, DefaultStrategy):
+                self.strategy.step_post_backward(
                     params=self.splats,
                     optimizers=self.optimizers,
                     state=self.strategy_state,
@@ -709,8 +711,8 @@ class Runner:
                     info=info,
                     packed=cfg.packed,
                 )
-            elif isinstance(self.cfg.strategy, MCMCStrategy):
-                self.cfg.strategy.step_post_backward(
+            elif isinstance(self.strategy, MCMCStrategy):
+                self.strategy.step_post_backward(
                     params=self.splats,
                     optimizers=self.optimizers,
                     state=self.strategy_state,
@@ -719,7 +721,7 @@ class Runner:
                     lr=schedulers[0].get_last_lr()[0],
                 )
             else:
-                assert_never(self.cfg.strategy)
+                assert_never(self.strategy)
 
             # Turn Gradients into Sparse Tensor before running optimizer
             if cfg.sparse_grad:
@@ -1080,6 +1082,8 @@ if __name__ == "__main__":
                 init_scale=0.1,
                 opacity_reg=0.01,
                 scale_reg=0.01,
+                normal_loss=True,
+                dist_loss=True,
                 strategy=MCMCStrategy(verbose=True),
             ),
         ),
