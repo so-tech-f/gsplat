@@ -37,6 +37,7 @@ from gsplat_viewer_2dgs import GsplatViewer, GsplatRenderTabState
 from gsplat.rendering import rasterization_2dgs, rasterization_2dgs_inria_wrapper
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from nerfview import CameraState, RenderTabState, apply_float_colormap
+import evo.core.geometry as geometry
 
 LOG_TINY_SCALE = math.log(1e-16)
 
@@ -73,13 +74,13 @@ class Config:
     # Number of training steps
     max_steps: int = 30_000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    eval_steps: List[int] = field(default_factory=lambda: [7_000, 20_000])
     # Steps to save the model
-    save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    save_steps: List[int] = field(default_factory=lambda: [7_000, 20_000])
     # Whether to save ply file (storage size can be large)
     save_ply: bool = False
     # Steps to save the model as ply
-    ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    ply_steps: List[int] = field(default_factory=lambda: [7_000, 20_000])
     # Format to export ply files
     export_fmt: Literal["ply", "splat", "ply_compressed"] = "ply"
     # Whether to disable video generation during training and evaluation
@@ -434,6 +435,7 @@ class Runner:
         Ks: Tensor,
         width: int,
         height: int,
+        masks: Tensor | None = None,
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Dict]:
         means = self.splats["means"]  # [N, 3]
@@ -507,6 +509,9 @@ class Runner:
             normals_from_depth = info["normals_surf"]
             render_distort = info["render_distloss"]
             render_median = render_colors[..., 3]
+
+        if masks is not None:
+            render_colors[~masks] = 0
 
         return (
             render_colors,
@@ -818,7 +823,6 @@ class Runner:
                 )
 
 
-
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps] or step == max_steps - 1:
                 self.eval(step)
@@ -837,12 +841,141 @@ class Runner:
                 # Update the scene.
                 self.viewer.update(step, num_train_rays_per_step)
 
+    # 3RGSのmlpモデルを使ってカメラ最適化をする場合は、評価用のカメラポーズも最適化する
+    def optim_eval_camtoworlds(self, camtoworlds, Ks, width, height, sh_degree, near_plane, far_plane, masks, pixels, image_id, show_progress=False):
+        with torch.enable_grad():
+            iters = 100 #* 2
+            pose_opt_lr = 8e-4
+            pose_adjust = CameraOptModule(1).to(self.device)
+            pose_adjust.zero_init()
+            pose_optimizer = torch.optim.Adam(
+                    pose_adjust.parameters(),
+                    lr=pose_opt_lr,
+            )
+            scheduler = torch.optim.lr_scheduler.ExponentialLR(
+                        pose_optimizer, gamma=0.01 ** (1.0 / iters)
+            )
+
+            # Use tqdm only if show_progress is True
+            iterator = tqdm.tqdm(range(iters), desc="Optimizing eval camera pose") if show_progress else range(iters)
+            for i in iterator:
+                camtoworlds_optim = pose_adjust(camtoworlds, torch.tensor([0],device=self.device))
+                renders, alphas, info = self.rasterize_splats(
+                    camtoworlds=camtoworlds_optim,
+                    Ks=Ks,
+                    width=width,
+                    height=height,
+                    sh_degree=sh_degree,
+                    near_plane=near_plane,
+                    far_plane=far_plane,
+                    masks=masks,
+                    optim_3dgs=True
+                )
+
+                #loss = F.l1_loss(renders, pixels)
+                # gradient loss
+                loss = compute_gradient_loss(pixels, renders)
+
+                loss.backward()
+                pose_optimizer.step()
+                pose_optimizer.zero_grad(set_to_none=True)
+                scheduler.step()
+
+                # Update progress bar description only if show_progress is True
+                if show_progress:
+                    iterator.set_description(f"Optimizing camera pose (loss={loss.item():.6f})")
+
+            # set gradients to none
+            for optimizer in self.optimizers.values():
+                optimizer.zero_grad(set_to_none=True)
+            for optimizer in self.pose_optimizers:
+                optimizer.zero_grad(set_to_none=True)
+            for optimizer in self.intrinsics_optimizers:
+                optimizer.zero_grad(set_to_none=True)
+            for optimizer in self.app_optimizers:
+                optimizer.zero_grad(set_to_none=True)
+            for optimizer in self.bil_grid_optimizers:
+                optimizer.zero_grad(set_to_none=True)
+        return camtoworlds_optim.detach()
+
+
+
     @torch.no_grad()
     def eval(self, step: int):
         """Entry for evaluation."""
         print("Running evaluation...")
         cfg = self.cfg
         device = self.device
+
+        trainloader = torch.utils.data.DataLoader(
+            self.trainvalset, batch_size=1, shuffle=False, num_workers=1
+        )
+        train_metrics = {"psnr": [], "ssim": [], "lpips": []}
+
+        camtoworlds_est, camtoworlds_gt, intrinsics, depthmaps = [], [], [],[]
+        for i, data in enumerate(trainloader):
+            camtoworlds = data["camtoworld"].to(device)
+            if "camtoworld_gt" in data:
+                pesudo_gt = False
+                camtoworld_gt = data["camtoworld_gt"].to(device)
+            else:
+                pesudo_gt = True
+                camtoworld_gt = camtoworlds
+
+            if cfg.pose_noise:
+                camtoworlds = self.pose_perturb(camtoworlds, data['image_id'].to(device))
+            if cfg.pose_opt:
+                camtoworlds = self.pose_adjust(camtoworlds, data['image_id'].to(device))
+
+            Ks = data["K"].to(device)
+            pixels = data["image"].to(device) / 255.0
+            masks = data["mask"].to(device) if "mask" in data else None
+            height, width = pixels.shape[1:3]
+
+            # intrinsics optimization
+            if cfg.intrinsics_opt:
+                Ks = torch.eye(3, dtype=torch.float32, device=device)[None].expand(camtoworlds.shape[0], 3, 3).clone()
+                Ks[:, 0, 0] = Ks[:, 1, 1] = self.focal_opt.exp()
+                Ks[:, 0:2, 2] = self.pp_opt * self.imsize
+                if step % 50 == 0:
+                    print(Ks)
+
+            camtoworlds_est.append(camtoworlds)
+            camtoworlds_gt.append(camtoworld_gt)
+            intrinsics.append(Ks)
+
+            torch.cuda.synchronize()
+            tic = time.time()
+            renders, _, _ = self.rasterize_splats(
+                camtoworlds=camtoworlds,
+                Ks=Ks,
+                width=width,
+                height=height,
+                sh_degree=cfg.sh_degree,
+                near_plane=cfg.near_plane,
+                far_plane=cfg.far_plane,
+                render_mode="RGB+ED",
+                masks=masks,
+            )  # [1, H, W, 3]
+            torch.cuda.synchronize()
+            ellipse_time += time.time() - tic
+
+            colors = torch.clamp(renders[..., 0:3], 0.0, 1.0)  # [1, H, W, 3]
+            depths = renders[..., 3:4]  # [1, H, W, 1]
+
+
+            depths = (depths - depths.min()) / (depths.max() - depths.min())
+
+            pixels_p = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
+            colors_p = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
+            train_metrics["psnr"].append(self.psnr(colors_p, pixels_p))
+            train_metrics["ssim"].append(self.ssim(colors_p, pixels_p))
+            train_metrics["lpips"].append(self.lpips(colors_p, pixels_p))
+
+        if cfg.pose_opt and cfg.pose_opt_type == "mlp":
+            a = torch.stack(camtoworlds_est,dim=0).squeeze(1).detach().cpu().numpy()
+            b = torch.stack(camtoworlds_gt,dim=0).squeeze(1).detach().cpu().numpy()
+            transform = align_pose(b, a).to(device)
 
         valloader = torch.utils.data.DataLoader(
             self.valset, batch_size=1, shuffle=False, num_workers=1
@@ -853,10 +986,27 @@ class Runner:
             camtoworlds = data["camtoworld"].to(device)
             Ks = data["K"].to(device)
             pixels = data["image"].to(device) / 255.0
+            masks = data["mask"].to(device) if "mask" in data else None
             height, width = pixels.shape[1:3]
 
             torch.cuda.synchronize()
             tic = time.time()
+            if cfg.pose_opt and cfg.pose_opt_type == "mlp":
+                # まず大まかにアラインメント
+                camtoworlds = torch.einsum('ij,bjk->bik', transform, camtoworlds)
+                # 微調整
+                camtoworlds = self.optim_eval_camtoworlds(camtoworlds=camtoworlds,
+                    Ks=Ks,
+                    width=width,
+                    height=height,
+                    sh_degree=cfg.sh_degree,
+                    near_plane=cfg.near_plane,
+                    far_plane=cfg.far_plane,
+                    masks=masks,
+                    pixels=pixels,
+                    image_id=i,
+                )
+
             (
                 colors,
                 alphas,
@@ -874,6 +1024,7 @@ class Runner:
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
                 render_mode="RGB+ED",
+                masks=masks,
             )  # [1, H, W, 3]
             colors = torch.clamp(colors, 0.0, 1.0)
             colors = colors[..., :3]  # Take RGB channels
@@ -943,26 +1094,44 @@ class Runner:
 
         ellipse_time /= len(valloader)
 
-        psnr = torch.stack(metrics["psnr"]).mean()
-        ssim = torch.stack(metrics["ssim"]).mean()
-        lpips = torch.stack(metrics["lpips"]).mean()
+        train_psnr = torch.stack(train_metrics["psnr"]).mean()
+        train_ssim = torch.stack(train_metrics["ssim"]).mean()
+        train_lpips = torch.stack(train_metrics["lpips"]).mean()
+
+        eval_psnr = torch.stack(metrics["psnr"]).mean()
+        eval_ssim = torch.stack(metrics["ssim"]).mean()
+        eval_lpips = torch.stack(metrics["lpips"]).mean()
+
         print(
-            f"PSNR: {psnr.item():.3f}, SSIM: {ssim.item():.4f}, LPIPS: {lpips.item():.3f} "
+            f"TRAIN PSNR: {train_psnr.item():.3f}, TRAIN SSIM: {train_ssim.item():.4f}, TRAIN LPIPS: {train_lpips.item():.3f} | "
+            f"EVAL PSNR: {eval_psnr.item():.3f}, EVAL SSIM: {eval_ssim.item():.4f}, EVAL LPIPS: {eval_lpips.item():.3f} "
             f"Time: {ellipse_time:.3f}s/image "
             f"Number of GS: {len(self.splats['means'])}"
         )
-        # save stats as json
-        stats = {
-            "psnr": psnr.item(),
-            "ssim": ssim.item(),
-            "lpips": lpips.item(),
+        # save train stats as json
+        train_stats = {
+            "train_psnr": train_psnr.item(),
+            "train_ssim": train_ssim.item(),
+            "train_lpips": train_lpips.item(),
+            "ellipse_time": ellipse_time,
+            "num_GS": len(self.splats["means"]),
+        }
+        with open(f"{self.stats_dir}/train_step{step:04d}.json", "w") as f:
+            json.dump(train_stats, f)
+
+        # save eval stats as json
+        eval_stats = {
+            "eval_psnr": eval_psnr.item(),
+            "eval_ssim": eval_ssim.item(),
+            "eval_lpips": eval_lpips.item(),
             "ellipse_time": ellipse_time,
             "num_GS": len(self.splats["means"]),
         }
         with open(f"{self.stats_dir}/val_step{step:04d}.json", "w") as f:
-            json.dump(stats, f)
+            json.dump(eval_stats, f)
+
         # save stats to tensorboard
-        for k, v in stats.items():
+        for k, v in eval_stats.items():
             self.writer.add_scalar(f"val/{k}", v, step)
         self.writer.flush()
 
@@ -1096,6 +1265,100 @@ class Runner:
             render_colors = render_colors[0, ..., 0:3].clamp(0, 1)
             renders = render_colors.cpu().numpy()
         return renders
+
+def compute_gradient_loss(pixels, colors, edge_threshold=4, rgb_boundary_threshold=0.01):
+    """
+    Compute gradient-aware loss with masking
+
+    Args:
+        pixels: Target image tensor [B, H, W, C]
+        colors: Rendered image tensor [B, H, W, C]
+        edge_threshold: Threshold for edge detection relative to median gradient
+        rgb_boundary_threshold: Threshold for RGB boundary detection
+    """
+    def image_gradient(image):
+        # Compute image gradient using Scharr Filter
+        c = image.shape[0]
+        conv_y = torch.tensor(
+            [[3, 0, -3], [10, 0, -10], [3, 0, -3]], dtype=torch.float32, device="cuda"
+        )
+        conv_x = torch.tensor(
+            [[3, 10, 3], [0, 0, 0], [-3, -10, -3]], dtype=torch.float32, device="cuda"
+        )
+        normalizer = 1.0 / torch.abs(conv_y).sum()
+        p_img = torch.nn.functional.pad(image, (1, 1, 1, 1), mode="reflect")[None]
+        img_grad_v = normalizer * torch.nn.functional.conv2d(
+            p_img, conv_x.view(1, 1, 3, 3).repeat(c, 1, 1, 1), groups=c
+        )
+        img_grad_h = normalizer * torch.nn.functional.conv2d(
+            p_img, conv_y.view(1, 1, 3, 3).repeat(c, 1, 1, 1), groups=c
+        )
+        return img_grad_v[0], img_grad_h[0]
+
+
+    def image_gradient_mask(image, eps=0.01):
+        # Compute image gradient mask
+        c = image.shape[0]
+        conv_y = torch.ones((1, 1, 3, 3), dtype=torch.float32, device="cuda")
+        conv_x = torch.ones((1, 1, 3, 3), dtype=torch.float32, device="cuda")
+        p_img = torch.nn.functional.pad(image, (1, 1, 1, 1), mode="reflect")[None]
+        p_img = torch.abs(p_img) > eps
+        img_grad_v = torch.nn.functional.conv2d(
+            p_img.float(), conv_x.repeat(c, 1, 1, 1), groups=c
+        )
+        img_grad_h = torch.nn.functional.conv2d(
+            p_img.float(), conv_y.repeat(c, 1, 1, 1), groups=c
+        )
+
+        return img_grad_v[0] == torch.sum(conv_x), img_grad_h[0] == torch.sum(conv_y)
+
+
+    # Process each batch item
+    batch_losses = []
+    for b in range(pixels.shape[0]):
+        # Convert target image to grayscale [1, H, W]
+        gray_img = pixels[b].permute(2, 0, 1).mean(dim=0, keepdim=True)
+
+        # Compute gradients and masks
+        gray_grad_v, gray_grad_h = image_gradient(gray_img)
+        mask_v, mask_h = image_gradient_mask(gray_img)
+
+        # Apply masks to gradients
+        gray_grad_v = gray_grad_v * mask_v
+        gray_grad_h = gray_grad_h * mask_h
+
+        # Compute gradient intensity
+        img_grad_intensity = torch.sqrt(gray_grad_v**2 + gray_grad_h**2)
+
+        # Create edge mask based on median threshold
+        median_img_grad_intensity = torch.median(img_grad_intensity)
+        image_mask = (img_grad_intensity > median_img_grad_intensity * edge_threshold).float()
+
+        # Create RGB boundary mask
+        rgb_pixel_mask = (pixels[b].sum(dim=-1) > rgb_boundary_threshold).float()
+
+        # Combine masks
+        combined_mask = image_mask * rgb_pixel_mask
+
+        # Compute masked L1 loss
+        batch_loss = combined_mask * torch.abs(colors[b] - pixels[b]).mean(dim=-1)
+        batch_losses.append(batch_loss.sum() / (combined_mask.sum() + 1e-8))
+
+    # Average losses across batch
+    return torch.stack(batch_losses).mean()
+
+
+def align_pose(pose_a, pose_b):
+    # Calculate alignment parameters using umeyama
+    r, t, c = geometry.umeyama_alignment(pose_a[:,:3,3].T, pose_b[:,:3,3].T, with_scale=True)
+
+    # Create 4x4 transformation matrix
+    device = pose_a.device if torch.is_tensor(pose_a) else torch.device('cpu')
+    transform = torch.eye(4, device=device)
+    transform[:3,:3] = c * torch.from_numpy(r).to(device).float()  # Apply rotation and scale
+    transform[:3,3] = torch.from_numpy(t).to(device).float()  # Add translation
+
+    return transform
 
 
 def main(cfg: Config):
