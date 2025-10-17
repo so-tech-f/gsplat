@@ -18,6 +18,7 @@ RUN apt-get update && \
         wget \
         ninja-build \
         build-essential \
+        curl \
         libboost-program-options-dev \
         libboost-filesystem-dev \
         libboost-graph-dev \
@@ -67,6 +68,9 @@ RUN pip install --no-cache-dir --upgrade pip 'setuptools>=64' && \
     pip install --no-cache-dir torch==2.1.2+cu118 torchvision==0.16.2+cu118 'numpy<2.0.0' --extra-index-url https://download.pytorch.org/whl/cu118 && \
     pip install --no-cache-dir pycolmap==0.6.1 pyceres==2.1 omegaconf==2.3.0
 
+RUN mkdir -p /root/.cache/torch/hub/checkpoints && \
+    curl -L -o /root/.cache/torch/hub/checkpoints/alexnet-owt-7be5be79.pth \
+    "https://download.pytorch.org/models/alexnet-owt-7be5be79.pth"
 
 # Install gsplat from local copy (for development).
 COPY . /gsplat
@@ -114,20 +118,18 @@ RUN apt-get update && \
         build-essential \
         python-is-python3 \
         ffmpeg \
-        curl \
         vim && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
 
-RUN mkdir -p /root/.cache/torch/hub/checkpoints && \
-    curl -L -o /root/.cache/torch/hub/checkpoints/alexnet-owt-7be5be79.pth \
-    "https://download.pytorch.org/models/alexnet-owt-7be5be79.pth"
-
 # Copy packages from builder stage.
 COPY --from=builder /build/colmap/ /usr/local/
 COPY --from=builder /usr/local/lib/python3.10/dist-packages/ /usr/local/lib/python3.10/dist-packages/
 COPY --from=builder /gsplat /gsplat
+
+RUN mkdir -p /root/.cache/torch/hub/checkpoints
+COPY --from=builder /root/.cache/torch/hub/checkpoints/alexnet-owt-7be5be79.pth /root/.cache/torch/hub/checkpoints/alexnet-owt-7be5be79.pth
 
 WORKDIR /gsplat
 
