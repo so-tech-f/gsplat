@@ -373,6 +373,7 @@ class Runner:
             elif cfg.pose_opt_type == "mlp":
                 self.pose_adjust = CameraOptModuleMLP(len(self.trainset)).to(self.device)
                 cfg.pose_opt_lr = 15e-5
+                cfg.pose_opt_reg = 0.0
             else:
                 assert_never(self.cfg.pose_opt_type)
             self.pose_adjust.zero_init()
