@@ -249,6 +249,7 @@ def relocate(
     mask: Tensor,
     binoms: Tensor,
     min_opacity: float = 0.005,
+    model_type: str | None = None,
 ):
     """Inplace relocate some dead Gaussians to the lives ones.
 
@@ -282,6 +283,8 @@ def relocate(
             p[sampled_idxs] = torch.logit(new_opacities)
         elif name == "scales":
             p[sampled_idxs] = torch.log(new_scales)
+            if model_type == "2dgs":
+                p[sampled_idxs, 2] = torch.log(torch.tensor(1e-16, device=p.device))
         p[dead_indices] = p[sampled_idxs]
         return torch.nn.Parameter(p, requires_grad=p.requires_grad)
 
@@ -305,6 +308,7 @@ def sample_add(
     n: int,
     binoms: Tensor,
     min_opacity: float = 0.005,
+    model_type: str | None = None
 ):
     opacities = torch.sigmoid(params["opacities"])
 
@@ -324,6 +328,8 @@ def sample_add(
             p[sampled_idxs] = torch.logit(new_opacities)
         elif name == "scales":
             p[sampled_idxs] = torch.log(new_scales)
+            if model_type == "2dgs":
+                p[sampled_idxs, 2] = torch.log(torch.tensor(1e-16, device=p.device))
         p_new = torch.cat([p, p[sampled_idxs]])
         return torch.nn.Parameter(p_new, requires_grad=p.requires_grad)
 

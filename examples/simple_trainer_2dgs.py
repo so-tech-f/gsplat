@@ -240,7 +240,7 @@ def create_splats_with_optimizers(
     dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
     dist_avg = torch.sqrt(dist2_avg)
     scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
-    scales[:, 2] = torch.log(torch.tensor(1e-16))
+    scales[:, 2] = torch.log(torch.tensor(1e-16, device=scales.device)).detach()
 
     quats = torch.rand((N, 4))  # [N, 4]
     opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
@@ -359,6 +359,7 @@ class Runner:
                 scene_scale=self.scene_scale
             )
         elif isinstance(self.strategy, MCMCStrategy):
+            self.strategy.model_type = self.model_type
             self.strategy_state = self.strategy.initialize_state()
         else:
             assert_never(self.strategy)
