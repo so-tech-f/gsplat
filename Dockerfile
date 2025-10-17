@@ -77,9 +77,9 @@ RUN cd /gsplat && \
     pip install --no-cache-dir -r examples/requirements.txt
 
 
-# Fix permissions
-RUN chmod -R go=u /usr/local/lib/python3.10 && \
-    chmod -R go=u /build
+# # Fix permissions
+# RUN chmod -R go=u /usr/local/lib/python3.10 && \
+#     chmod -R go=u /build
 
 #
 # Docker runtime stage.
@@ -128,6 +128,8 @@ RUN mkdir -p /root/.cache/torch/hub/checkpoints && \
 COPY --from=builder /build/colmap/ /usr/local/
 COPY --from=builder /usr/local/lib/python3.10/dist-packages/ /usr/local/lib/python3.10/dist-packages/
 COPY --from=builder /gsplat /gsplat
+
+WORKDIR /gsplat
 
 # Bash as default entrypoint.
 CMD /bin/bash -l
