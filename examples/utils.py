@@ -47,7 +47,7 @@ class CameraOptModule(torch.nn.Module):
         transform[..., :3, 3] = dx
         return torch.matmul(camtoworlds, transform)
 
-
+# Camera pose optimization using MLP derived from '3R-GS: Best Practice in Optimizing Camera Poses Along with 3DGS' (https://github.com/zsh523/3rgs)
 class CameraOptModuleMLP(torch.nn.Module):
     """Camera pose optimization module using MLP."""
 
