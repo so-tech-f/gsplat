@@ -127,8 +127,12 @@ RUN mkdir -p /root/.cache/torch/hub/checkpoints && \
 # Copy packages from builder stage.
 COPY --from=builder /build/colmap/ /usr/local/
 COPY --from=builder /usr/local/lib/python3.10/dist-packages/ /usr/local/lib/python3.10/dist-packages/
-COPY --from=builder /gsplat /gsplat
 
+# Remove this line for development
+# COPY --from=builder /gsplat /gsplat
+
+# Create gsplat directory (will be mounted)
+RUN mkdir -p /gsplat
 
 
 # Bash as default entrypoint.
