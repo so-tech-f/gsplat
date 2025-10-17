@@ -114,14 +114,22 @@ RUN apt-get update && \
         build-essential \
         python-is-python3 \
         ffmpeg \
+        curl \
         vim && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
+
+
+RUN mkdir -p /root/.cache/torch/hub/checkpoints && \
+    curl -L -o /root/.cache/torch/hub/checkpoints/alexnet-owt-7be5be79.pth \
+    "https://download.pytorch.org/models/alexnet-owt-7be5be79.pth"
 
 # Copy packages from builder stage.
 COPY --from=builder /build/colmap/ /usr/local/
 COPY --from=builder /usr/local/lib/python3.10/dist-packages/ /usr/local/lib/python3.10/dist-packages/
 COPY --from=builder /gsplat /gsplat
+
+
 
 # Bash as default entrypoint.
 CMD /bin/bash -l
