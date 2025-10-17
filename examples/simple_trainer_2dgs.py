@@ -31,6 +31,7 @@ from utils import (
     rgb_to_sh,
     set_random_seed,
 )
+from gsplat import export_splats
 from gsplat_viewer_2dgs import GsplatViewer, GsplatRenderTabState
 from gsplat.rendering import rasterization_2dgs, rasterization_2dgs_inria_wrapper
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
@@ -73,6 +74,14 @@ class Config:
     eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
     # Steps to save the model
     save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    # Whether to save ply file (storage size can be large)
+    save_ply: bool = False
+    # Steps to save the model as ply
+    ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    # Format to export ply files
+    export_fmt: Literal["ply", "splat", "ply_compressed"] = "ply"
+    # Whether to disable video generation during training and evaluation
+    disable_video: bool = False
 
     # Initialization strategy
     init_type: str = "sfm"
@@ -762,13 +771,35 @@ class Runner:
                 print("Step: ", step, stats)
                 with open(f"{self.stats_dir}/train_step{step:04d}.json", "w") as f:
                     json.dump(stats, f)
+                data = {"step": step, "splats": self.splats.state_dict()}
+                if cfg.pose_opt:
+                    data["pose_adjust"] = self.pose_adjust.state_dict()
                 torch.save(
-                    {
-                        "step": step,
-                        "splats": self.splats.state_dict(),
-                    },
+                    data,
                     f"{self.ckpt_dir}/ckpt_{step}.pt",
                 )
+
+            if (
+                step in [i - 1 for i in cfg.ply_steps] or step == max_steps - 1
+            ) and cfg.save_ply:
+                means = self.splats["means"]
+                scales = self.splats["scales"]
+                quats = self.splats["quats"]
+                opacities = self.splats["opacities"]
+                sh0 = self.splats["sh0"]
+                shN = self.splats["shN"]
+                export_splats(
+                    means=means,
+                    scales=scales,
+                    quats=quats,
+                    opacities=opacities,
+                    sh0=sh0,
+                    shN=shN,
+                    format=cfg.export_fmt,
+                    save_to=f"{self.ply_dir}/point_cloud_{step}.{cfg.export_fmt}",
+                )
+
+
 
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps] or step == max_steps - 1:
@@ -920,6 +951,8 @@ class Runner:
     @torch.no_grad()
     def render_traj(self, step: int):
         """Entry for trajectory rendering."""
+        if self.cfg.disable_video:
+            return
         print("Running trajectory rendering...")
         cfg = self.cfg
         device = self.device
