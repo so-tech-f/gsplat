@@ -72,7 +72,7 @@ RUN pip install --no-cache-dir --upgrade pip 'setuptools>=64' && \
 COPY . /gsplat
 RUN cd /gsplat && \
     export TORCH_CUDA_ARCH_LIST="$(echo "$CUDA_ARCHITECTURES" | tr ';' '\n' | awk '$0 > 70 {print substr($0,1,1)"."substr($0,2)}' | tr '\n' ' ' | sed 's/ $//')" && \
-    export MAX_JOBS=4 && \
+    export MAX_JOBS=12 && \
     pip install --no-cache-dir -e . --use-pep517 --no-build-isolation && \
     pip install --no-cache-dir -r examples/requirements.txt
 
@@ -127,13 +127,7 @@ RUN mkdir -p /root/.cache/torch/hub/checkpoints && \
 # Copy packages from builder stage.
 COPY --from=builder /build/colmap/ /usr/local/
 COPY --from=builder /usr/local/lib/python3.10/dist-packages/ /usr/local/lib/python3.10/dist-packages/
-
-# Remove this line for development
-# COPY --from=builder /gsplat /gsplat
-
-# Create gsplat directory (will be mounted)
-RUN mkdir -p /gsplat
-
+COPY --from=builder /gsplat /gsplat
 
 # Bash as default entrypoint.
 CMD /bin/bash -l

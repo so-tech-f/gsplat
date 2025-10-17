@@ -53,7 +53,7 @@ class MCMCStrategy(Strategy):
     refine_every: int = 100
     min_opacity: float = 0.005
     verbose: bool = False
-    model_type: str = None
+    model_type: str | None = None
 
     def initialize_state(self) -> Dict[str, Any]:
         """Initialize and return the running state for this strategy."""
