@@ -73,13 +73,13 @@ class Config:
     # Number of training steps
     max_steps: int = 30_000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [7_000, 20_000])
+    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
     # Steps to save the model
-    save_steps: List[int] = field(default_factory=lambda: [7_000, 20_000])
+    save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
     # Whether to save ply file (storage size can be large)
     save_ply: bool = False
     # Steps to save the model as ply
-    ply_steps: List[int] = field(default_factory=lambda: [7_000, 20_000])
+    ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
     # Format to export ply files
     export_fmt: Literal["ply", "splat", "ply_compressed"] = "ply"
     # Whether to disable video generation during training and evaluation
@@ -1371,6 +1371,10 @@ def main(cfg: Config):
 
 
 if __name__ == "__main__":
+    steps = [10_000, 20_000, 30_000]
+    max_steps = max(steps)
+    steps = field(default_factory=lambda: steps)
+
     # Config objects we can choose between.
     # Each is a tuple of (CLI description, config object).
     configs = {
@@ -1393,6 +1397,10 @@ if __name__ == "__main__":
                 pose_opt=True,
                 pose_opt_type="mlp",
                 data_factor=1,
+                max_steps=max_steps,
+                eval_steps=steps,
+                save_steps=steps,
+                ply_steps=steps,
                 strategy=MCMCStrategy(verbose=True),
             ),
         ),
