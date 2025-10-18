@@ -63,7 +63,6 @@ RUN git clone https://github.com/colmap/colmap.git && \
     cd ~
 
 # Upgrade pip and install dependencies.
-# pip install torch==2.2.2 torchvision==0.17.2 --index-url https://download.pytorch.org/whl/cu118 && \
 RUN pip install --no-cache-dir --upgrade pip 'setuptools>=64' && \
     pip install --no-cache-dir torch==2.1.2+cu118 torchvision==0.16.2+cu118 'numpy<2.0.0' --extra-index-url https://download.pytorch.org/whl/cu118 && \
     pip install --no-cache-dir pycolmap==0.6.1 pyceres==2.1 omegaconf==2.3.0
@@ -79,11 +78,6 @@ RUN cd /gsplat && \
     export MAX_JOBS=12 && \
     pip install --no-cache-dir -e . --use-pep517 --no-build-isolation && \
     pip install --no-cache-dir -r examples/requirements.txt
-
-
-# # Fix permissions
-# RUN chmod -R go=u /usr/local/lib/python3.10 && \
-#     chmod -R go=u /build
 
 #
 # Docker runtime stage.
