@@ -5,7 +5,6 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Union
 from pathlib import Path
-
 import imageio
 import nerfview
 import numpy as np
@@ -316,7 +315,7 @@ class Runner:
         self.parser = Parser(
             data_dir=cfg.data_dir,
             factor=cfg.data_factor,
-            normalize=cfg.normalize_world_space,
+            normalize=cfg.normalize_world_space and (cfg.init_type == "sfm"),
             test_every=cfg.test_every,
         )
         self.trainset = Dataset(
