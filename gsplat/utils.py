@@ -204,6 +204,50 @@ def depth_to_points(
     points = origins[..., None, None, :] + depths * directions
     return points
 
+def compute_pixel_rays(
+        camtoworlds: Tensor, Ks: Tensor, height: int, width: int) -> Tensor:
+    """Convert pixel coordinates to ray directions in world space
+
+    Args:
+        camtoworlds: Camera-to-world transformation matrices [..., 4, 4]
+        Ks: Camera intrinsics [..., 3, 3]
+
+    Returns:
+        directions: Normalized ray directions in world coordinates [..., H, W, 3]
+    """
+    device = camtoworlds.device
+    x, y = torch.meshgrid(
+        torch.arange(width, device=device),
+        torch.arange(height, device=device),
+        indexing="xy",
+    )  # [H, W]
+
+    fx = Ks[..., 0, 0]  # [...]
+    fy = Ks[..., 1, 1]  # [...]
+    cx = Ks[..., 0, 2]  # [...]
+    cy = Ks[..., 1, 2]  # [...]
+
+    # camera directions in camera coordinates
+    camera_dirs = F.pad(
+        torch.stack(
+            [
+                (x - cx[..., None, None] + 0.5) / fx[..., None, None],
+                (y - cy[..., None, None] + 0.5) / fy[..., None, None],
+            ],
+            dim=-1,
+        ),
+        (0, 1),
+        value=1.0,
+    )  # [..., H, W, 3]
+
+    # ray directions in world coordinates
+    directions = torch.einsum(
+        "...ij,...hwj->...hwi", camtoworlds[..., :3, :3], camera_dirs
+    )  # [..., H, W, 3]
+
+    directions = F.normalize(directions, dim=-1)
+
+    return directions
 
 def depth_to_normal(
     depths: Tensor, camtoworlds: Tensor, Ks: Tensor, z_depth: bool = True

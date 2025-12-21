@@ -33,10 +33,13 @@ from utils import (
 )
 from gsplat import export_splats
 from gsplat_viewer_2dgs import GsplatViewer, GsplatRenderTabState
-from gsplat.rendering import rasterization_2dgs, rasterization_2dgs_inria_wrapper
+from gsplat.rendering import rasterization_2dgs
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
+from gsplat.cuda._wrapper import spherical_harmonics
+from gsplat.utils import compute_pixel_rays
 from nerfview import CameraState, RenderTabState, apply_float_colormap
 import evo.core.geometry as geometry
+from splatfactow_field import BGField, SplatfactoWField
 
 LOG_TINY_SCALE = math.log(1e-16)
 
@@ -141,9 +144,6 @@ class Config:
     # Whether to use revised opacity heuristic from arXiv:2404.06109 (experimental)
     revised_opacity: bool = False
 
-    # Use random background for training to discourage transparency
-    random_bkgd: bool = False
-
     # Opacity regularization
     opacity_reg: float = 0.0
     # Scale regularization
@@ -159,15 +159,6 @@ class Config:
     pose_opt_reg: float = 1e-6
     # Add noise to camera extrinsics. This is only to test the camera pose optimization.
     pose_noise: float = 0.0
-
-    # Enable appearance optimization. (experimental)
-    app_opt: bool = False
-    # Appearance embedding dimension
-    app_embed_dim: int = 16
-    # Learning rate for appearance optimization
-    app_opt_lr: float = 1e-3
-    # Regularization for appearance optimization as weight decay
-    app_opt_reg: float = 1e-6
 
     # Enable depth loss. (experimental)
     depth_loss: bool = False
@@ -187,9 +178,25 @@ class Config:
     dist_lambda: float = 1e-2
     # Iteration to start distortion loss regulerization
     dist_start_iter: int = 3_000
-
-    # Model for splatting.
-    model_type: Literal["2dgs", "2dgs-inria"] = "2dgs"
+    # background model derived from splatfacto-w ===============================
+    enable_bg_model: bool = False
+    # Number of layers in the background model
+    bg_num_layers: int = 3
+    # Width of each layer in the background model
+    bg_layer_width: int = 128
+    # The degree of SH to use for the background model
+    bg_sh_degree: int = 4
+    # Dimension of the appearance embedding, if 0, no appearance embedding is used
+    appearance_embed_dim: int = 48
+    # Number of layers in the appearance model
+    appearance_num_layers: int = 3
+    # Width of each layer in the appearance model
+    appearance_layer_width: int = 256
+    # Whether to enable the alpha loss for punishing gaussians from occupying background space, this also works with pure color background (i.e. white for overexposed skys)
+    enable_alpha_loss: bool = False
+    # Dimension of the appearance feature
+    appearance_features_dim: int = 72
+    # ==============================================================================
 
     # Dump information to tensorboard every this steps
     tb_every: int = 100
@@ -227,7 +234,7 @@ def create_splats_with_optimizers(
     sh_degree: int = 3,
     sparse_grad: bool = False,
     batch_size: int = 1,
-    feature_dim: Optional[int] = None,
+    appearance_features_dim: int = 72,
     device: str = "cuda",
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
     if init_type == "sfm":
@@ -248,6 +255,7 @@ def create_splats_with_optimizers(
 
     quats = torch.rand((N, 4))  # [N, 4]
     opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
+    appearance_features = torch.zeros((N, appearance_features_dim)).float().cuda()
 
     params = [
         # name, value, lr
@@ -255,20 +263,8 @@ def create_splats_with_optimizers(
         ("scales", torch.nn.Parameter(scales), 5e-3),
         ("quats", torch.nn.Parameter(quats), 1e-3),
         ("opacities", torch.nn.Parameter(opacities), 5e-2),
+        ("appearance_features", torch.nn.Parameter(appearance_features), 2e-2),
     ]
-
-    if feature_dim is None:
-        # color is SH coefficients.
-        colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
-        colors[:, 0, :] = rgb_to_sh(rgbs)
-        params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), 2.5e-3))
-        params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), 2.5e-3 / 20))
-    else:
-        # features will be used for appearance and view-dependent shading
-        features = torch.rand(N, feature_dim)  # [N, feature_dim]
-        params.append(("features", torch.nn.Parameter(features), 2.5e-3))
-        colors = torch.logit(rgbs)  # [N, 3]
-        params.append(("colors", torch.nn.Parameter(colors), 2.5e-3))
 
     splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
     # Scale learning rate based on batch size, reference:
@@ -330,7 +326,6 @@ class Runner:
         print("Scene scale:", self.scene_scale)
 
         # Model
-        feature_dim = 32 if cfg.app_opt else None
         self.splats, self.optimizers = create_splats_with_optimizers(
             self.parser,
             init_type=cfg.init_type,
@@ -342,19 +337,83 @@ class Runner:
             sh_degree=cfg.sh_degree,
             sparse_grad=cfg.sparse_grad,
             batch_size=cfg.batch_size,
-            feature_dim=feature_dim,
+            appearance_features_dim=cfg.appearance_features_dim,
             device=self.device,
         )
+
+        self.appearance_embeds = torch.nn.Embedding(
+            len(self.trainset), cfg.appearance_embed_dim
+        ).to(self.device)
+
+        self.appearance_embeds_optimizers = [
+            torch.optim.Adam(
+                self.appearance_embeds.parameters(),
+                lr=1e-3 * math.sqrt(cfg.batch_size),
+                eps=1e-15 / math.sqrt(cfg.batch_size),
+                betas=(1 - cfg.batch_size * (1 - 0.9), 1 - cfg.batch_size * (1 - 0.999)),
+            )
+        ]
+
+        self.bg_model_optimizers = {}
+        if cfg.enable_bg_model:
+            self.bg_model = BGField(
+                appearance_embedding_dim=cfg.appearance_embed_dim,
+                sh_levels=cfg.bg_sh_degree,
+                num_layers=cfg.bg_num_layers,
+                layer_width=cfg.bg_layer_width,
+                device=self.device,
+            )
+            bg_model_params = [
+                ("bg_model_encoder", self.bg_model.encoder.parameters(), 2e-3),
+                ("bg_model_sh_base", self.bg_model.sh_base_head.parameters(), 2e-3),
+                ("bg_model_sh_rest", self.bg_model.sh_rest_head.parameters(), 2e-3 / 20),
+            ]
+            self.bg_model_optimizers = {
+                name: torch.optim.Adam(
+                    params,
+                    lr=lr * math.sqrt(cfg.batch_size),
+                    eps=1e-15 / math.sqrt(cfg.batch_size),
+                    betas=(1 - cfg.batch_size * (1 - 0.9), 1 - cfg.batch_size * (1 - 0.999)),
+                )
+                for name, params, lr in bg_model_params
+            }
+
+        else:
+            self.bg_model = None
+
+        self.color_model_optimizers = {}
+        self.color_model = SplatfactoWField(
+            appearance_embed_dim=cfg.appearance_embed_dim,
+            appearance_features_dim=cfg.appearance_features_dim,
+            sh_levels=cfg.sh_degree,
+            num_layers=cfg.appearance_num_layers,
+            layer_width=cfg.appearance_layer_width,
+            device=self.device,
+        )
+        color_model_params = [
+                ("color_model_encoder", self.color_model.encoder.parameters(), 2e-3),
+                ("color_model_sh_base", self.color_model.sh_base_head.parameters(), 2e-3),
+                ("color_model_sh_rest", self.color_model.sh_rest_head.parameters(), 2e-3 / 20),
+            ]
+        self.color_model_optimizers = {
+                name: torch.optim.Adam(
+                    params,
+                    lr=lr * math.sqrt(cfg.batch_size),
+                    eps=1e-15 / math.sqrt(cfg.batch_size),
+                    betas=(1 - cfg.batch_size * (1 - 0.9), 1 - cfg.batch_size * (1 - 0.999)),
+                )
+                for name, params, lr in color_model_params
+        }
+
+        self.cached_colors = None
+        self.cached_bg_sh = None
+
         print("Model initialized. Number of GS:", len(self.splats["means"]))
-        self.model_type = cfg.model_type
 
         self.strategy = self.cfg.strategy
         self.strategy.check_sanity(self.splats, self.optimizers)
 
-        if self.model_type == "2dgs":
-            key_for_gradient = "gradient_2dgs"
-        else:
-            key_for_gradient = "means2d"
+        key_for_gradient = "gradient_2dgs"
 
         if isinstance(self.strategy, DefaultStrategy):
             for attr in ['prune_opa', 'grow_grad2d', 'grow_scale3d', 'prune_scale3d', 'absgrad', 'revised_opacity']:
@@ -364,7 +423,7 @@ class Runner:
                 scene_scale=self.scene_scale
             )
         elif isinstance(self.strategy, MCMCStrategy):
-            self.strategy.model_type = self.model_type
+            self.strategy.model_type = "2dgs"
             self.strategy_state = self.strategy.initialize_state()
         else:
             assert_never(self.strategy)
@@ -392,26 +451,6 @@ class Runner:
             self.pose_perturb = CameraOptModule(len(self.trainset)).to(self.device)
             self.pose_perturb.random_init(cfg.pose_noise)
 
-        self.app_optimizers = []
-        if cfg.app_opt:
-            self.app_module = AppearanceOptModule(
-                len(self.trainset), feature_dim, cfg.app_embed_dim, cfg.sh_degree
-            ).to(self.device)
-            # initialize the last layer to be zero so that the initial output is zero.
-            torch.nn.init.zeros_(self.app_module.color_head[-1].weight)
-            torch.nn.init.zeros_(self.app_module.color_head[-1].bias)
-            self.app_optimizers = [
-                torch.optim.Adam(
-                    self.app_module.embeds.parameters(),
-                    lr=cfg.app_opt_lr * math.sqrt(cfg.batch_size) * 10.0,
-                    weight_decay=cfg.app_opt_reg,
-                ),
-                torch.optim.Adam(
-                    self.app_module.color_head.parameters(),
-                    lr=cfg.app_opt_lr * math.sqrt(cfg.batch_size),
-                ),
-            ]
-
         # Losses & Metrics.
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
         self.psnr = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
@@ -436,6 +475,7 @@ class Runner:
         width: int,
         height: int,
         masks: Tensor | None = None,
+        training: bool = True,
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Dict]:
         means = self.splats["means"]  # [N, 3]
@@ -444,77 +484,61 @@ class Runner:
         quats = self.splats["quats"]  # [N, 4]
         scales = torch.exp(self.splats["scales"])  # [N, 3]
         opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
+        appearance_features = self.splats["appearance_features"]  # [N, F]
 
-        image_ids = kwargs.pop("image_ids", None)
-        if self.cfg.app_opt:
-            colors = self.app_module(
-                features=self.splats["features"],
-                embed_ids=image_ids,
-                dirs=means[None, :, :] - camtoworlds[:, None, :3, 3],
-                sh_degree=kwargs.pop("sh_degree", self.cfg.sh_degree),
+        image_id = kwargs.pop("image_ids", None)
+
+        if image_id is not None:
+            appearance_embed = self.appearance_embeds(
+                image_id
             )
-            colors = colors + self.splats["colors"]
-            colors = torch.sigmoid(colors)
         else:
-            colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
+            appearance_embed = self.appearance_embeds.weight.mean(dim=0)
+
+        if not training and self.cached_colors is not None:
+            colors = self.cached_colors.detach()
+        else:
+            colors = self.color_model(
+                appearance_embed=appearance_embed.repeat(appearance_features.shape[0], 1),
+                appearance_features=appearance_features,
+            ).float()
+            self.cached_colors = colors
 
         assert self.cfg.antialiased is False, "Antialiased is not supported for 2DGS"
 
-        if self.model_type == "2dgs":
-            (
-                render_colors,
-                render_alphas,
-                render_normals,
-                normals_from_depth,
-                render_distort,
-                render_median,
-                info,
-            ) = rasterization_2dgs(
-                means=means,
-                quats=quats,
-                scales=scales,
-                opacities=opacities,
-                colors=colors,
-                viewmats=torch.linalg.inv(camtoworlds),  # [C, 4, 4]
-                Ks=Ks,  # [C, 3, 3]
-                width=width,
-                height=height,
-                packed=self.cfg.packed,
-                absgrad=(
-                    self.strategy.absgrad
-                    if isinstance(self.strategy, DefaultStrategy)
-                    else False
-                ),
-                sparse_grad=self.cfg.sparse_grad,
-                **kwargs,
-            )
-        elif self.model_type == "2dgs-inria":
-            renders, info = rasterization_2dgs_inria_wrapper(
-                means=means,
-                quats=quats,
-                scales=scales,
-                opacities=opacities,
-                colors=colors,
-                viewmats=torch.linalg.inv(camtoworlds),  # [C, 4, 4]
-                Ks=Ks,  # [C, 3, 3]
-                width=width,
-                height=height,
-                packed=self.cfg.packed,
-                absgrad=self.cfg.absgrad,
-                sparse_grad=self.cfg.sparse_grad,
-                **kwargs,
-            )
-            render_colors, render_alphas = renders
-            render_normals = info["normals_rend"]
-            normals_from_depth = info["normals_surf"]
-            render_distort = info["render_distloss"]
-            render_median = render_colors[..., 3]
+        (
+            render_colors,
+            render_alphas,
+            render_normals,
+            normals_from_depth,
+            render_distort,
+            render_median,
+            info,
+        ) = rasterization_2dgs(
+            means=means,
+            quats=quats,
+            scales=scales,
+            opacities=opacities,
+            colors=colors,
+            viewmats=torch.linalg.inv(camtoworlds),  # [C, 4, 4]
+            Ks=Ks,  # [C, 3, 3]
+            width=width,
+            height=height,
+            packed=self.cfg.packed,
+            absgrad=(
+                self.strategy.absgrad
+                if isinstance(self.strategy, DefaultStrategy)
+                else False
+            ),
+            sparse_grad=self.cfg.sparse_grad,
+            **kwargs,
+        )
 
         if masks is not None:
             render_colors[~masks] = 0
 
         return (
-            render_colors,
+            render_colors, # [..., C, height, width, X].
             render_alphas,
             render_normals,
             normals_from_depth,
@@ -539,12 +563,43 @@ class Runner:
             torch.optim.lr_scheduler.ExponentialLR(
                 self.optimizers["means"], gamma=0.01 ** (1.0 / max_steps)
             ),
+            torch.optim.lr_scheduler.ExponentialLR(
+                self.optimizers["appearance_features"], gamma=5e-2 ** (1.0 / max_steps)
+            ),
+            torch.optim.lr_scheduler.ExponentialLR(
+                self.appearance_embeds_optimizers[0], gamma=0.3 ** (1.0 / max_steps)
+            ),
+            torch.optim.lr_scheduler.ExponentialLR(
+                self.color_model_optimizers["color_model_encoder"], gamma=5e-2 ** (1.0 / max_steps)
+            ),
+            torch.optim.lr_scheduler.ExponentialLR(
+                self.color_model_optimizers["color_model_sh_base"], gamma=5e-2 ** (1.0 / max_steps)
+            ),
+            torch.optim.lr_scheduler.ExponentialLR(
+                self.color_model_optimizers["color_model_sh_rest"], gamma=5e-2 / 20 ** (1.0 / max_steps)
+            )
         ]
         if cfg.pose_opt:
             # pose optimization has a learning rate schedule
             schedulers.append(
                 torch.optim.lr_scheduler.ExponentialLR(
                     self.pose_optimizers[0], gamma=0.01 ** (1.0 / max_steps)
+                )
+            )
+        if cfg.enable_bg_model:
+            schedulers.append(
+                torch.optim.lr_scheduler.ExponentialLR(
+                    self.bg_model_optimizers["bg_model_encoder"], gamma=5e-2 ** (1.0 / max_steps)
+                )
+            )
+            schedulers.append(
+                torch.optim.lr_scheduler.ExponentialLR(
+                    self.bg_model_optimizers["bg_model_sh_base"], gamma=0.1 ** (1.0 / max_steps)
+                )
+            )
+            schedulers.append(
+                torch.optim.lr_scheduler.ExponentialLR(
+                    self.bg_model_optimizers["bg_model_sh_rest"], gamma=0.1 / 20 ** (1.0 / max_steps)
                 )
             )
 
@@ -580,7 +635,7 @@ class Runner:
             num_train_rays_per_step = (
                 pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
             )
-            image_ids = data["image_id"].to(device)
+            image_id = data["image_id"].to(device)
             if cfg.depth_loss:
                 points = data["points"].to(device)  # [1, M, 2]
                 depths_gt = data["depths"].to(device)  # [1, M]
@@ -588,13 +643,19 @@ class Runner:
             height, width = pixels.shape[1:3]
 
             if cfg.pose_noise:
-                camtoworlds = self.pose_perturb(camtoworlds, image_ids)
+                camtoworlds = self.pose_perturb(camtoworlds, image_id)
 
             if cfg.pose_opt:
-                camtoworlds = self.pose_adjust(camtoworlds, image_ids)
+                camtoworlds = self.pose_adjust(camtoworlds, image_id)
 
             # sh schedule
             sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
+            if cfg.enable_bg_model:
+                bg_sh_degree_to_use = min(
+                    step // cfg.sh_degree_interval, cfg.bg_sh_degree
+                )
+            else:
+                bg_sh_degree_to_use = None
 
             # forward
             (
@@ -613,7 +674,7 @@ class Runner:
                 sh_degree=sh_degree_to_use,
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
-                image_ids=image_ids,
+                image_ids=image_id,
                 render_mode="RGB+ED" if cfg.depth_loss else "RGB+D",
                 distloss=self.cfg.dist_loss,
             )
@@ -622,9 +683,12 @@ class Runner:
             else:
                 colors, depths = renders, None
 
-            if cfg.random_bkgd:
-                bkgd = torch.rand(1, 3, device=device)
-                colors = colors + bkgd * (1.0 - alphas)
+            appearance_embed = self.appearance_embeds(image_id)
+            if cfg.enable_bg_model:
+                background = self.compute_background(camtoworlds, Ks, width, height, bg_sh_degree_to_use, appearance_embed=appearance_embed)
+                colors = colors + (1.0 - alphas) * background
+
+            colors = torch.clamp(colors, 0.0, 1.0)
 
             self.strategy.step_pre_backward(
                 params=self.splats,
@@ -692,6 +756,33 @@ class Runner:
                 loss += cfg.opacity_reg * torch.sigmoid(self.splats["opacities"]).mean()
             if cfg.scale_reg > 0.0:
                 loss += cfg.scale_reg * torch.exp(self.splats["scales"]).mean()
+
+            if cfg.enable_bg_model and cfg.enable_alpha_loss:
+                alpha_loss = torch.tensor(0.0).to(self.device)
+                # bgモデルでよくあらわされている部分についてはガウシアンのalphaを小さくするように促す
+                # for those pixel are well represented by bg and has low alpha, we encourage the gaussian to be transparent
+                bg_mask = torch.abs(pixels - background).mean(dim=-1, keepdim=True) < 0.003
+                # use a box filter to avoid penalty high frequency parts
+                f = 3
+                window = (torch.ones((f, f)).view(1, 1, f, f) / (f * f)).cuda()
+                # マスクを平滑化
+                bg_mask = (
+                    torch.nn.functional.conv2d(
+                        bg_mask.float().permute(0, 3, 1, 2),
+                        window,
+                        stride=1,
+                        padding="same",
+                    )
+                    .permute(0, 2, 3, 1)
+                    .squeeze(0)
+                )
+                # 平滑化後のマスク値が0.6を超えるピクセルを最終的な背景領域として判定します。
+                alpha_mask = bg_mask > 0.6
+                # prevent NaN
+                if alpha_mask.sum() != 0: # meanの計算時に割るときに0割りを防ぐ
+                    # マスクした領域のalphaが大きくならないようにペナルティをかけるloss
+                    alpha_loss = alphas.squeeze(0)[alpha_mask].mean() * 0.15
+                loss += alpha_loss
 
             loss.backward()
 
@@ -777,7 +868,13 @@ class Runner:
             for optimizer in self.pose_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
-            for optimizer in self.app_optimizers:
+            for optimizer in self.appearance_embeds_optimizers:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+            for optimizer in self.bg_model_optimizers.values():
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+            for optimizer in self.color_model_optimizers.values():
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             for scheduler in schedulers:
@@ -809,8 +906,11 @@ class Runner:
                 scales = self.splats["scales"]
                 quats = self.splats["quats"]
                 opacities = self.splats["opacities"]
-                sh0 = self.splats["sh0"]
-                shN = self.splats["shN"]
+                appearance_features = self.splats["appearance_features"]  # [N, F]
+                appearance_embed = self.appearance_embeds(image_id)
+                sh_coeffs = self.color_model(appearance_embed.repeat(appearance_features.shape[0], 1), appearance_features)
+                sh0 = sh_coeffs[:, 0, :].unsqueeze(1)  # [N, 1, 3] - DC成分
+                shN = sh_coeffs[:, 1:, :]  # [N, sh_dim-1, 3] - 高次成分
                 export_splats(
                     means=means,
                     scales=scales,
@@ -842,7 +942,7 @@ class Runner:
                 self.viewer.update(step, num_train_rays_per_step)
 
     # 3RGSのmlpモデルを使ってカメラ最適化をする場合は、評価用のカメラポーズも最適化する
-    def optim_eval_camtoworlds(self, camtoworlds, Ks, width, height, sh_degree, near_plane, far_plane, masks, pixels, image_id, show_progress=False):
+    def optim_eval_camtoworlds(self, camtoworlds, Ks, width, height, sh_degree, near_plane, far_plane, masks, pixels, show_progress=False):
         with torch.enable_grad():
             iters = 100 #* 2
             pose_opt_lr = 8e-4
@@ -858,9 +958,9 @@ class Runner:
 
             # Use tqdm only if show_progress is True
             iterator = tqdm.tqdm(range(iters), desc="Optimizing eval camera pose") if show_progress else range(iters)
-            for i in iterator:
+            for _ in iterator:
                 camtoworlds_optim = pose_adjust(camtoworlds, torch.tensor([0],device=self.device))
-                renders, *_ = self.rasterize_splats(
+                colors, alphas, *_ = self.rasterize_splats(
                     camtoworlds=camtoworlds_optim,
                     Ks=Ks,
                     width=width,
@@ -869,11 +969,18 @@ class Runner:
                     near_plane=near_plane,
                     far_plane=far_plane,
                     masks=masks,
+                    training=False,
                 )
+                colors = colors[..., 0:3]
+                if self.cfg.enable_bg_model:
+                    background = self.compute_background(camtoworlds, Ks, width, height, self.cfg.bg_sh_degree, appearance_embed=None, training=False)
+                    colors = colors + (1.0 - alphas) * background
+
+                colors = torch.clamp(colors, 0.0, 1.0)
 
                 #loss = F.l1_loss(renders, pixels)
                 # gradient loss
-                loss = compute_gradient_loss(pixels, renders)
+                loss = compute_gradient_loss(pixels, colors)
 
                 loss.backward()
                 pose_optimizer.step()
@@ -889,10 +996,7 @@ class Runner:
                 optimizer.zero_grad(set_to_none=True)
             for optimizer in self.pose_optimizers:
                 optimizer.zero_grad(set_to_none=True)
-            for optimizer in self.app_optimizers:
-                optimizer.zero_grad(set_to_none=True)
         return camtoworlds_optim.detach()
-
 
 
     @torch.no_grad()
@@ -902,6 +1006,7 @@ class Runner:
         cfg = self.cfg
         device = self.device
 
+        # trainset全体の評価
         trainloader = torch.utils.data.DataLoader(
             self.trainvalset, batch_size=1, shuffle=False, num_workers=1
         )
@@ -927,14 +1032,14 @@ class Runner:
             pixels = data["image"].to(device) / 255.0
             masks = data["mask"].to(device) if "mask" in data else None
             height, width = pixels.shape[1:3]
-
+            image_id = data["image_id"].to(device)
 
             camtoworlds_est.append(camtoworlds)
             camtoworlds_gt.append(camtoworld_gt)
 
             torch.cuda.synchronize()
             tic = time.time()
-            renders, *_ = self.rasterize_splats(
+            renders, alphas, *_ = self.rasterize_splats(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
                 width=width,
@@ -944,9 +1049,15 @@ class Runner:
                 far_plane=cfg.far_plane,
                 render_mode="RGB+ED",
                 masks=masks,
+                training=False,
             )  # [1, H, W, 3]
             torch.cuda.synchronize()
             traineval_ellipse_time += time.time() - tic
+            colors = renders[..., 0:3]  # [1, H, W, 3]
+            appearance_embed = self.appearance_embeds(image_id)
+            if cfg.enable_bg_model:
+                background = self.compute_background(camtoworlds, Ks, width, height, cfg.bg_sh_degree, appearance_embed=appearance_embed)
+                colors = colors + (1.0 - alphas) * background
 
             colors = torch.clamp(renders[..., 0:3], 0.0, 1.0)  # [1, H, W, 3]
             depths = renders[..., 3:4]  # [1, H, W, 1]
@@ -967,6 +1078,7 @@ class Runner:
             b = torch.stack(camtoworlds_gt,dim=0).squeeze(1).detach().cpu().numpy()
             transform = align_pose(b, a).to(device)
 
+        # valset全体の評価
         valloader = torch.utils.data.DataLoader(
             self.valset, batch_size=1, shuffle=False, num_workers=1
         )
@@ -978,6 +1090,7 @@ class Runner:
             pixels = data["image"].to(device) / 255.0
             masks = data["mask"].to(device) if "mask" in data else None
             height, width = pixels.shape[1:3]
+            image_id = data["image_id"].to(device)
 
             torch.cuda.synchronize()
             tic = time.time()
@@ -994,7 +1107,6 @@ class Runner:
                     far_plane=cfg.far_plane,
                     masks=masks,
                     pixels=pixels,
-                    image_id=i,
                 )
 
             (
@@ -1015,9 +1127,15 @@ class Runner:
                 far_plane=cfg.far_plane,
                 render_mode="RGB+ED",
                 masks=masks,
+                training=False,
             )  # [1, H, W, 3]
-            colors = torch.clamp(colors, 0.0, 1.0)
             colors = colors[..., :3]  # Take RGB channels
+            if cfg.enable_bg_model:
+                background = self.compute_background(camtoworlds, Ks, width, height, cfg.bg_sh_degree, appearance_embed=None, training=False)
+                colors = colors + (1.0 - alphas) * background
+
+            colors = torch.clamp(colors, 0.0, 1.0)
+
             torch.cuda.synchronize()
             eval_ellipse_time += max(time.time() - tic, 1e-10)
 
@@ -1151,7 +1269,7 @@ class Runner:
 
         canvas_all = []
         for i in tqdm.trange(len(camtoworlds), desc="Rendering trajectory"):
-            renders, _, _, surf_normals, _, _, _ = self.rasterize_splats(
+            renders, alphas, _, surf_normals, _, _, _ = self.rasterize_splats(
                 camtoworlds=camtoworlds[i : i + 1],
                 Ks=K[None],
                 width=width,
@@ -1160,8 +1278,13 @@ class Runner:
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
                 render_mode="RGB+ED",
+                training=False,
             )  # [1, H, W, 4]
-            colors = torch.clamp(renders[0, ..., 0:3], 0.0, 1.0)  # [H, W, 3]
+            colors = renders[..., 0:3]  # [1, H, W, 3]
+            if cfg.enable_bg_model:
+                background = self.compute_background(camtoworlds[i:i+1], K, width, height, self.cfg.bg_sh_degree, appearance_embed=None, training=False)
+                colors = colors + (1.0 - alphas) * background
+            colors = torch.clamp(colors, 0.0, 1.0).squeeze(0)  # [H, W, 3]
             depths = renders[0, ..., 3:4]  # [H, W, 1]
             depths = (depths - depths.min()) / (depths.max() - depths.min())
 
@@ -1208,7 +1331,7 @@ class Runner:
             normals_from_depth,
             render_distort,
             render_median,
-            info,
+            info
         ) = self.rasterize_splats(
             camtoworlds=c2w[None],
             Ks=K[None],
@@ -1220,6 +1343,7 @@ class Runner:
             radius_clip=render_tab_state.radius_clip,
             eps2d=render_tab_state.eps2d,
             render_mode="RGB+ED",
+            training=False,
             backgrounds=torch.tensor([render_tab_state.backgrounds], device=self.device)
             / 255.0,
         )  # [1, H, W, 3]
@@ -1253,9 +1377,32 @@ class Runner:
                 apply_float_colormap(alpha, render_tab_state.colormap).cpu().numpy()
             )
         else:
-            render_colors = render_colors[0, ..., 0:3].clamp(0, 1)
+            render_colors = render_colors[0, ..., 0:3]
+            if self.enable_bg_model:
+                background = self.compute_background(c2w[None], K[None], width, height, self.cfg.bg_sh_degree, appearance_embed=None, training=False)
+                render_colors = render_colors + (1.0 - render_alphas) * background
+            render_colors = render_colors.clamp(0, 1)
             renders = render_colors.cpu().numpy()
         return renders
+
+    def compute_background(self, camtoworlds, Ks, width, height, bg_sh_degree_to_use, appearance_embed=None, training=True):
+
+        directions = compute_pixel_rays(camtoworlds, Ks, width, height)
+        directions = directions.view(-1, 3)  # [H*W, 3]
+        if not training and self.cached_bg_sh is not None and appearance_embed is None:
+            bg_sh_coeffs = self.cached_bg_sh.detach()
+        else:
+            bg_sh_coeffs = self.bg_model(appearance_embed)
+            self.cached_bg_sh = bg_sh_coeffs
+        background = spherical_harmonics(
+            degrees_to_use=bg_sh_degree_to_use,
+            dirs=directions,
+            coeffs=bg_sh_coeffs.repeat(directions.shape[0], 1, 1),
+        )
+        background = background.view(1, height, width, 3)
+
+        return background
+
 
 def compute_gradient_loss(pixels, colors, edge_threshold=4, rgb_boundary_threshold=0.01):
     """
@@ -1371,10 +1518,8 @@ def main(cfg: Config):
 
 
 if __name__ == "__main__":
-    steps = [10_000, 20_000, 30_000]
+    steps = [1_000, 10_000, 20_000, 30_000]
     max_steps = max(steps)
-    steps = field(default_factory=lambda: steps)
-
     # Config objects we can choose between.
     # Each is a tuple of (CLI description, config object).
     configs = {
@@ -1401,6 +1546,8 @@ if __name__ == "__main__":
                 eval_steps=steps,
                 save_steps=steps,
                 ply_steps=steps,
+                enable_bg_model=True,
+                enable_alpha_loss=True,
                 strategy=MCMCStrategy(verbose=True),
             ),
         ),
@@ -1408,3 +1555,31 @@ if __name__ == "__main__":
     cfg = tyro.extras.overridable_config_cli(configs)
     cfg.adjust_steps(cfg.steps_scaler)
     main(cfg)
+
+''' memo: splatfactow_model.py L1060~L1081
+        use_cached_sh = False
+        if camera.metadata is not None and "cam_idx" in camera.metadata:
+            cam_idx = camera.metadata["cam_idx"]
+            # 評価時のみキャッシュ判定
+            # 複数のメトリクス(PSNR、SSIM、LPIPS)でレンダリングを繰り返さないように
+            if self.last_cam_idx is not None and not self.training:
+                use_cached_sh = cam_idx == self.last_cam_idx
+                if cam_idx != self.last_cam_idx:
+                    CONSOLE.log("Current camera idx is", cam_idx)
+            self.last_cam_idx = cam_idx
+            # indexを指定して取得する
+            appearance_embed = self.appearance_embeds(
+                torch.tensor(cam_idx, device=self.device)
+            )
+        else:
+            if self.config.use_avg_appearance:
+                # calculate the average appearance embedding
+                appearance_embed = self.appearance_embeds.weight.mean(dim=0)
+            else:
+                appearance_embed = self.appearance_embeds(
+                    torch.tensor(0, device=self.device)
+                )
+
+    appearance_embedをどの画像から作るか or エンベディングを平均したものを使うかをちゃんと考える必要があるかも
+
+'''

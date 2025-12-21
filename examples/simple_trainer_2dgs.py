@@ -1373,7 +1373,6 @@ def main(cfg: Config):
 if __name__ == "__main__":
     steps = [10_000, 20_000, 30_000]
     max_steps = max(steps)
-    steps = field(default_factory=lambda: steps)
 
     # Config objects we can choose between.
     # Each is a tuple of (CLI description, config object).
